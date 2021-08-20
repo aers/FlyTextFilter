@@ -1,13 +1,35 @@
 ﻿using System;
+using System.Diagnostics;
+using System.Linq;
 using System.Numerics;
 using System.Runtime.InteropServices;
 using Dalamud.Hooking;
 using Dalamud.Plugin;
+using FFXIVClientStructs.FFXIV.Client.Game.Character;
 using ImGuiNET;
+using Lumina.Misc;
 using Lumina.Text;
 
 namespace FlyTextFilter
 {
+    public enum MemoryProtection
+    {
+        Execute = 0x10,
+        ExecuteRead = 0x20,
+        ExecuteReadWrite = 0x40,
+        ExecuteWriteCopy = 0x80,
+        NoAccess = 0x01,
+        ReadOnly = 0x02,
+        ReadWrite = 0x04,
+        WriteCopy = 0x08,
+        TargetsInvalid = 0x40000000,
+        TargetsNoUpdate = TargetsInvalid,
+        Guard = 0x100,
+        NoCache = 0x200,
+        WriteCombine = 0x400
+    }
+
+    
     /// <summary>
     /// Enum of FlyTextKind values. Members suffixed with
     /// a number seem to be a duplicate, or perform duplicate behavior.
@@ -220,7 +242,7 @@ namespace FlyTextFilter
         CriticalDirectHit2 = 51
     }
 
-    public class FlyTextFilter : IDalamudPlugin
+    public unsafe class FlyTextFilter : IDalamudPlugin
     {
         public string Name => "FlyTextFilter";
 
@@ -228,7 +250,12 @@ namespace FlyTextFilter
         private FlyTextFilterConfig _config;
 
         private bool ConfigOpen = false;
-        
+
+        private string _addToBlacklist = "";
+        private string _removeBlacklist = null;
+
+        private byte[] origBytes = new byte[9];
+        private IntPtr addScreenLogAddress = IntPtr.Zero;
         private delegate IntPtr CreateFlyTextDelegate(
             IntPtr addonFlyText,
             FlyTextKind kind,
@@ -241,16 +268,38 @@ namespace FlyTextFilter
             float yOffset);
 
         private Hook<CreateFlyTextDelegate> createFlyTextHook;
+
+        private delegate void AddScreenLogDelegate(
+            Character* target, Character* source, int logKind, int option, int actionKind, int actionId, int val1,
+            int val2, int val3, int val4);
+
+        private Hook<AddScreenLogDelegate> addScreenLogHook;
+        
+        [DllImport("kernel32.dll", SetLastError = true, ExactSpelling = true)]
+        public static extern bool VirtualProtect(
+            IntPtr lpAddress,
+            UIntPtr dwSize,
+            MemoryProtection flNewProtection,
+            out MemoryProtection lpflOldProtect);
         
         public void Initialize(DalamudPluginInterface pluginInterface)
         {
             _interface = pluginInterface;
-            _config = new FlyTextFilterConfig();
+            _config = pluginInterface.GetPluginConfig() as FlyTextFilterConfig ?? new FlyTextFilterConfig();
             _config.Initialize(_interface);
             var address =
                 _interface.TargetModuleScanner.ScanText("48 89 74 24 ?? 48 89 7C 24 ?? 41 56 48 83 EC 40 48 63 FA");
             createFlyTextHook = new Hook<CreateFlyTextDelegate>(address, CreateFlyTextDetour);
             createFlyTextHook.Enable();
+
+            addScreenLogAddress = _interface.TargetModuleScanner.ScanText("E8 ?? ?? ?? ?? BB ?? ?? ?? ?? EB 32");
+            Dalamud.SafeMemory.ReadBytes(addScreenLogAddress, 9, out origBytes);
+            VirtualProtect(addScreenLogAddress, new UIntPtr(9), MemoryProtection.ReadWrite, out var oldProtect);
+            Dalamud.SafeMemory.WriteBytes(addScreenLogAddress,
+                new byte[] { 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90 });
+            VirtualProtect(addScreenLogAddress, new UIntPtr(9), oldProtect, out oldProtect);
+            addScreenLogHook = new Hook<AddScreenLogDelegate>(addScreenLogAddress, AddScreenLogDetour);
+            addScreenLogHook.Enable();
             
             _interface.UiBuilder.OnOpenConfigUi += UiBuilder_OnOpenConfigUi;
             _interface.UiBuilder.OnBuildUi += UiBuilder_OnBuild;
@@ -258,7 +307,12 @@ namespace FlyTextFilter
 
         public void Dispose()
         {
+            addScreenLogHook.Dispose();
             createFlyTextHook.Dispose();
+            VirtualProtect(addScreenLogAddress, new UIntPtr(9), MemoryProtection.ReadWrite, out var oldProtect);
+            Dalamud.SafeMemory.WriteBytes(addScreenLogAddress,
+                origBytes);
+            VirtualProtect(addScreenLogAddress, new UIntPtr(9), oldProtect, out oldProtect);
             _interface.UiBuilder.OnOpenConfigUi -= UiBuilder_OnOpenConfigUi;
             _interface.UiBuilder.OnBuildUi -= UiBuilder_OnBuild;
         }
@@ -275,17 +329,38 @@ namespace FlyTextFilter
         {
             if (text1 != IntPtr.Zero)
             {
-                PluginLog.Log($"{kind} - {Marshal.PtrToStringAnsi(text1)}");
+                var text = Marshal.PtrToStringAnsi(text1);
+                if (text != null)
+                {
+                    PluginLog.Log($"{kind} - {text}");
+                    if (_config.Blacklist.Any(str => str.Contains(text)))
+                        return IntPtr.Zero;
+                }
             }
             else
             {
                 PluginLog.Log($"{kind}");
             }
 
-            if ((int)kind < 52 && !_config.KindToggleArray[(int)kind])
-                return IntPtr.Zero;
-                
             return createFlyTextHook.Original(addonFlyText, kind, val1, val2, text2, color, icon, text1, yOffset);
+        }
+
+        private void AddScreenLogDetour(
+            Character* target, Character* source, int logKind, int option, int actionKind, int actionId, int val1,
+            int val2, int val3, int val4)
+        {
+            if (target is null) return;
+            if (logKind >= 52) return;
+            var localPlayer = _interface.ClientState.LocalPlayer;
+            if (localPlayer is not null)
+            {
+                if (localPlayer.Address.ToInt64() == (long)source && !_config.KindToggleListPlayer[logKind])
+                    return;
+                if (localPlayer.Address.ToInt64() != (long)source && !_config.KindToggleListOther[logKind])
+                    return;
+            }
+
+            addScreenLogHook.Original(target, source, logKind, option, actionKind, actionId, val1, val2, val3, val4);
         }
         
         public void UiBuilder_OnOpenConfigUi(object sender, EventArgs args) => ConfigOpen = true;
@@ -294,25 +369,91 @@ namespace FlyTextFilter
         {
             if (!ConfigOpen) return;
 
-            ImGui.SetNextWindowSize(new Vector2(300, 400));
+            ImGui.SetNextWindowSize(new Vector2(600, 700));
             if (!ImGui.Begin(Name, ref ConfigOpen))
             {
                 ImGui.End();
                 return;
             }
-            
-            ImGui.Text("Use /xllog to see a log of message kinds.");
 
-            bool configChanged = false;
-            
-            foreach(int i in Enum.GetValues(typeof(FlyTextKind)))
+            if (ImGui.BeginTabBar("###mainbar"))
             {
-                configChanged |= ImGui.Checkbox($"{Enum.GetName(typeof(FlyTextKind), i)}",
-                    ref _config.KindToggleArray[i]);
-            }
+                if (ImGui.BeginTabItem("Types"))
+                {
+                    ImGui.Text("Use /xllog to see a log of message kinds.");
 
-            if (configChanged)
-                _config.Save();
+                    bool configChanged = false;
+
+                    if (ImGui.BeginTable("table_kinds", 3))
+                    {
+                        ImGui.TableSetupScrollFreeze(0, 1);
+                        ImGui.TableSetupColumn("Kind", ImGuiTableColumnFlags.None);
+                        ImGui.TableSetupColumn("Show From Yourself", ImGuiTableColumnFlags.None);
+                        ImGui.TableSetupColumn("Show From Others", ImGuiTableColumnFlags.None);
+                        ImGui.TableHeadersRow();
+                        
+                        foreach (int i in Enum.GetValues(typeof(FlyTextKind)))
+                        {
+                            ImGui.TableNextRow();
+                            ImGui.TableSetColumnIndex(0);
+                            ImGui.Text($"{Enum.GetName(typeof(FlyTextKind), i)}");
+                            ImGui.TableSetColumnIndex(1);
+                            bool temp = _config.KindToggleListPlayer[i];
+                            configChanged |= ImGui.Checkbox($"###{i}player",
+                                ref temp);
+                            _config.KindToggleListPlayer[i] = temp;
+
+                            ImGui.TableSetColumnIndex(2);
+                        
+                            temp = _config.KindToggleListOther[i];
+                            configChanged |= ImGui.Checkbox($"###{i}others",
+                                ref temp);
+                            _config.KindToggleListOther[i] = temp;
+                        }
+
+                        ImGui.EndTable();
+                    }
+
+
+                    if (configChanged)
+                        _config.Save();
+
+                    ImGui.EndTabItem();
+                }
+
+                if (ImGui.BeginTabItem("Name Blacklist"))
+                {
+                    ImGui.InputText("###addToBlacklist", ref _addToBlacklist, 100);
+                    if (ImGui.Button("Add To Blacklist"))
+                    {
+                        _config.Blacklist.Add(_addToBlacklist);
+                        _config.Save();
+                    }
+                    
+                    ImGui.Separator();
+                    
+                    foreach(var blString in _config.Blacklist)
+                    {
+                        if (ImGui.Button($"Remove###{blString}"))
+                        {
+                            _removeBlacklist = blString;
+                        }
+                        ImGui.SameLine();
+                        ImGui.Text(blString);
+                    }
+
+                    if (_removeBlacklist is not null)
+                    {
+                        _config.Blacklist.Remove(_removeBlacklist);
+                        _removeBlacklist = null;
+                        _config.Save();
+                    }
+
+                    ImGui.EndTabItem();
+                }
+
+                ImGui.EndTabBar();
+            }
 
             ImGui.End();
         }

@@ -1,6 +1,6 @@
 {
     "Name": "FlyTextFilter",
-    "Author": "someone",
+    "Author": "aers",
     "Description": "Filter fly text by type.",
-    "RepoUrl": ""
+    "RepoUrl": "https://github.com/aers/flytextfilter"
 }
